@@ -1,85 +1,83 @@
 # -*- coding: utf-8 -*-
 """
-YOLO 检测人 → 裁剪人体区域 → rembg 做人体分割 → 生成二值剪影图
+YOLO-seg 直接提取 person mask，生成二值剪影图
+
+流程：
+1. 读取输入文件夹中的所有图片
+2. 用 YOLO-seg 做实例分割
+3. 只保留 person 类
+4. 默认选择“主人体”（面积最大，或结合上一帧位置连续性）
+5. 输出：
+   - full_mask: 原图坐标系下的整幅二值剪影图
+   - crop_mask: 裁剪后的人体局部二值剪影图
+   - debug: 调试可视化图（检测框 + mask 叠加）
 
 适用场景：
-- 原始输入是一系列视频帧图片
-- 希望从复杂背景中先检测出人，再对“人体局部区域”做分割
-- 用于步态识别前处理，得到人体二值剪影图
-
-输出内容：
-1. full_mask/      -> 放回原图坐标系的整幅二值剪影图
-2. crop_mask/      -> 裁剪后人体区域内的二值剪影图
-3. debug/          -> 调试图（检测框 + 分割结果可视化）
-4. crop_rgb/       -> 裁剪后的人体RGB图（可选，方便检查）
+- 视频逐帧图片
+- 想提取步态识别所需的二值人体轮廓
 """
 
 import os
-import io
 import cv2
 import numpy as np
-from PIL import Image
 from ultralytics import YOLO
-from rembg import remove, new_session
 
 
 # =========================================================
-# 一、路径与参数配置区
+# 一、路径与参数配置
 # =========================================================
 
 # 输入帧文件夹
 INPUT_DIR = "/home/zzzandan/desk/gait/gait/gait/data/output/frames"
 
 # 输出总文件夹
-OUTPUT_DIR = "/home/zzzandan/desk/gait/gait/gait/data/output/silhouettes_yolo"
+OUTPUT_DIR = "/home/zzzandan/desk/gait/gait/gait/data/output/silhouettes_yoloseg"
 
-# YOLO 检测模型
-# 可选: yolov8n.pt / yolov8s.pt / yolov8m.pt
-# n 最快，m 更准一些，但更慢
-YOLO_MODEL_PATH = "yolov8n.pt"
+# YOLO-seg 模型
+# 可选：
+#   yolov8n-seg.pt  速度快
+#   yolov8s-seg.pt  更准一点
+MODEL_PATH = "yolov8n-seg.pt"
 
-# YOLO person 类别 id（COCO 数据集里 person 通常是 0）
+# person 类别 id（COCO 数据集里 person 通常是 0）
 PERSON_CLASS_ID = 0
 
 # 检测置信度阈值
-# 低了会引入误检，高了可能漏检
-YOLO_CONF_THRES = 0.25
+CONF_THRES = 0.25
 
-# NMS IoU 阈值（通常默认就可以）
-YOLO_IOU_THRES = 0.45
+# NMS IoU 阈值
+IOU_THRES = 0.45
 
-# 对检测框做 padding，防止裁剪时切掉手脚
-# 建议 0.05 ~ 0.12 之间调
-PAD_RATIO_X = 0.08
-PAD_RATIO_Y = 0.10
+# 是否启用上一帧位置连续性约束
+# False：每帧选面积最大的 person
+# True：第一帧选最大 person，后续优先选离上一帧最近的 person
+USE_TEMPORAL_TRACKING = False
 
-# rembg 使用的人体分割模型
-# u2net_human_seg 比默认模型更适合人体
-REMBG_MODEL_NAME = "u2net_human_seg"
-
-# rembg 输出 alpha 通道阈值
-# 越大越严格，前景更干净，但也更容易丢细节
-# 建议尝试 160 / 180 / 200
-ALPHA_THRESH = 180
-
-# 形态学参数
-OPEN_KERNEL_SIZE = 3
-CLOSE_KERNEL_SIZE = 5
-
-# 连通域面积阈值
-# 用来过滤很小的噪点
-MIN_COMPONENT_AREA = 100
+# 如果启用位置连续性约束，距离惩罚系数越小越偏向“离上一帧近”
+# 当前简单实现不需要显式用这个参数，保留是为了后续扩展
+TRACKING_DISTANCE_WEIGHT = 1.0
 
 # 是否保存调试图
 SAVE_DEBUG = True
 
-# 是否保存裁剪后 RGB 小图
+# 是否保存裁剪后的小剪影图
+SAVE_CROP_MASK = True
+
+# 是否保存裁剪后的人体 RGB 图
 SAVE_CROP_RGB = True
 
-# 是否启用“上一帧位置连续性约束”
-# False：每帧选面积最大的 person
-# True：第一帧选最大 person，后续优先选离上一帧最近的人
-USE_TEMPORAL_TRACKING = False
+# 后处理：开运算核大小
+OPEN_KERNEL_SIZE = 3
+
+# 后处理：闭运算核大小
+CLOSE_KERNEL_SIZE = 5
+
+# 最小连通域面积，小于这个阈值的最大连通域会被视为无效
+MIN_COMPONENT_AREA = 100
+
+# 检测框 padding，防止裁剪时切掉头脚
+PAD_RATIO_X = 0.05
+PAD_RATIO_Y = 0.08
 
 
 # =========================================================
@@ -87,7 +85,7 @@ USE_TEMPORAL_TRACKING = False
 # =========================================================
 
 def ensure_dir(path: str):
-    """如果文件夹不存在，则创建。"""
+    """如果目录不存在，则创建。"""
     os.makedirs(path, exist_ok=True)
 
 
@@ -95,26 +93,18 @@ def keep_largest_component(mask: np.ndarray, min_area: int = 0) -> np.ndarray:
     """
     只保留最大连通域。
 
-    为什么要这么做：
-    - rembg 在人体局部区域里仍可能分出多个碎块
-    - 例如衣服边缘噪点、地面亮块、旁边物体等
-    - 步态识别更需要“完整人体轮廓”，所以通常保留最大那一块更合理
-
-    参数：
-    - mask: 二值图，前景为255，背景为0
-    - min_area: 最大连通域面积如果小于这个阈值，则认为无效，返回全黑图
+    为什么要这样做：
+    - YOLO-seg 输出的 mask 有时会有零碎小块
+    - 步态识别更希望得到“单个人体”的完整轮廓
     """
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
 
-    # 没有前景
     if num_labels <= 1:
         return np.zeros_like(mask)
 
-    # 跳过背景（第0类），找到面积最大的前景连通域
     largest_label = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
     largest_area = stats[largest_label, cv2.CC_STAT_AREA]
 
-    # 面积太小，直接判为无效
     if largest_area < min_area:
         return np.zeros_like(mask)
 
@@ -125,47 +115,37 @@ def keep_largest_component(mask: np.ndarray, min_area: int = 0) -> np.ndarray:
 
 def postprocess_mask(mask: np.ndarray) -> np.ndarray:
     """
-    对二值 mask 做后处理：
+    对 mask 做后处理：
     1. 开运算去小噪点
     2. 闭运算补小孔洞
-    3. 只保留最大连通域
-
-    这样处理后的人体轮廓通常会更干净。
+    3. 保留最大连通域
     """
     kernel_open = np.ones((OPEN_KERNEL_SIZE, OPEN_KERNEL_SIZE), np.uint8)
     kernel_close = np.ones((CLOSE_KERNEL_SIZE, CLOSE_KERNEL_SIZE), np.uint8)
 
-    # 去掉小的孤立噪点
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_open)
-
-    # 填补人体内部的小空洞
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_close)
-
-    # 只保留最大人体区域
     mask = keep_largest_component(mask, min_area=MIN_COMPONENT_AREA)
-
     return mask
 
 
 def box_center(box):
     """
-    输入 box=(x1,y1,x2,y2,conf)，返回中心点(cx, cy)
+    输入 box=(x1, y1, x2, y2, conf)，返回中心点(cx, cy)
     """
     x1, y1, x2, y2, _ = box
-    cx = (x1 + x2) / 2.0
-    cy = (y1 + y2) / 2.0
-    return cx, cy
+    return (x1 + x2) / 2.0, (y1 + y2) / 2.0
 
 
-def pad_box(x1, y1, x2, y2, img_w, img_h, pad_ratio_x=0.08, pad_ratio_y=0.10):
+def pad_box(x1, y1, x2, y2, img_w, img_h):
     """
-    对检测框加 padding，避免切掉人体边缘。
+    对检测框加一点 padding，避免裁剪太紧。
     """
     bw = x2 - x1
     bh = y2 - y1
 
-    pad_x = bw * pad_ratio_x
-    pad_y = bh * pad_ratio_y
+    pad_x = bw * PAD_RATIO_X
+    pad_y = bh * PAD_RATIO_Y
 
     nx1 = max(0, int(round(x1 - pad_x)))
     ny1 = max(0, int(round(y1 - pad_y)))
@@ -175,133 +155,118 @@ def pad_box(x1, y1, x2, y2, img_w, img_h, pad_ratio_x=0.08, pad_ratio_y=0.10):
     return nx1, ny1, nx2, ny2
 
 
-def choose_person_box(result, img_w, img_h, prev_center=None):
+def resize_mask_if_needed(mask: np.ndarray, target_h: int, target_w: int) -> np.ndarray:
     """
-    从 YOLO 检测结果中选一个“主人体框”。
+    如果 YOLO 输出的 mask 尺寸和原图不同，则 resize 到原图大小。
+    一定要用最近邻插值，避免二值边界被模糊。
+    """
+    h, w = mask.shape[:2]
+    if h == target_h and w == target_w:
+        return mask
+    return cv2.resize(mask, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
 
-    两种策略：
-    1. 不启用时序跟踪：
-       - 直接从所有 person 框中选择面积最大的
-    2. 启用时序跟踪：
-       - 如果没有上一帧中心，第一帧仍然选最大框
-       - 如果有上一帧中心，则优先选“与上一帧中心距离最近”的框
 
-    为什么要这样：
-    - 多人场景下，只按面积最大可能会跳人
-    - 加一个最简单的时序连续性约束，会稳很多
+def choose_main_person(result, img_h: int, img_w: int, prev_center=None):
+    """
+    从 YOLO-seg 结果中选择一个“主人体”。
+
+    规则：
+    - 只考虑 person 类，且置信度 >= CONF_THRES
+    - 如果不启用时序约束，直接选面积最大的那个
+    - 如果启用时序约束，第一帧选最大，后续选离上一帧最近的
 
     返回：
-    - best_box = (x1, y1, x2, y2, conf)
-    - 如果没有 person，返回 None
+    {
+        "box": (x1, y1, x2, y2, conf),
+        "mask": full_mask_uint8  # 原图坐标系下，0/255
+    }
+    如果没有找到，返回 None
     """
-    if result.boxes is None or len(result.boxes) == 0:
+    if result.boxes is None or result.masks is None:
         return None
 
-    person_boxes = []
+    boxes = result.boxes
+    masks = result.masks
 
-    for box in result.boxes:
-        cls_id = int(box.cls.item())
-        conf = float(box.conf.item())
-        if cls_id != PERSON_CLASS_ID or conf < YOLO_CONF_THRES:
+    if len(boxes) == 0 or masks is None or masks.data is None:
+        return None
+
+    candidates = []
+
+    # masks.data 与 boxes 顺序一一对应
+    mask_data = masks.data.cpu().numpy()  # [N, H, W], 值一般为0/1
+    orig_h, orig_w = img_h, img_w
+
+    for i in range(len(boxes)):
+        cls_id = int(boxes.cls[i].item())
+        conf = float(boxes.conf[i].item())
+
+        if cls_id != PERSON_CLASS_ID or conf < CONF_THRES:
             continue
 
-        x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().tolist()
+        x1, y1, x2, y2 = boxes.xyxy[i].cpu().numpy().tolist()
         x1, y1, x2, y2 = map(float, [x1, y1, x2, y2])
 
-        # 加 padding
-        px1, py1, px2, py2 = pad_box(
-            x1, y1, x2, y2,
-            img_w=img_w,
-            img_h=img_h,
-            pad_ratio_x=PAD_RATIO_X,
-            pad_ratio_y=PAD_RATIO_Y
-        )
+        # 取对应 mask
+        mask = mask_data[i]
+        mask = (mask > 0.5).astype(np.uint8) * 255
+        mask = resize_mask_if_needed(mask, orig_h, orig_w)
 
-        area = max(0, px2 - px1) * max(0, py2 - py1)
-        person_boxes.append((px1, py1, px2, py2, conf, area))
+        # 后处理
+        mask = postprocess_mask(mask)
 
-    if len(person_boxes) == 0:
+        # 面积
+        area = int((mask > 0).sum())
+        if area < MIN_COMPONENT_AREA:
+            continue
+
+        # 加 padding 后的框
+        px1, py1, px2, py2 = pad_box(x1, y1, x2, y2, img_w=img_w, img_h=img_h)
+
+        candidates.append({
+            "box": (px1, py1, px2, py2, conf),
+            "mask": mask,
+            "area": area
+        })
+
+    if len(candidates) == 0:
         return None
 
-    # 不启用连续性约束：选面积最大的
+    # 不启用时序约束：直接选面积最大的
     if (not USE_TEMPORAL_TRACKING) or (prev_center is None):
-        best = max(person_boxes, key=lambda x: x[5])
-        return best[:5]
+        best = max(candidates, key=lambda x: x["area"])
+        return best
 
-    # 启用连续性约束：选距离上一帧中心最近的
+    # 启用时序约束：选距离上一帧中心最近的
     prev_cx, prev_cy = prev_center
 
-    def score_fn(b):
-        x1, y1, x2, y2, conf, area = b
+    def score_fn(item):
+        x1, y1, x2, y2, _ = item["box"]
         cx = (x1 + x2) / 2.0
         cy = (y1 + y2) / 2.0
         dist = (cx - prev_cx) ** 2 + (cy - prev_cy) ** 2
         return dist
 
-    best = min(person_boxes, key=score_fn)
-    return best[:5]
+    best = min(candidates, key=score_fn)
+    return best
 
 
-def rembg_segment_human(crop_bgr: np.ndarray, session) -> np.ndarray:
-    """
-    对裁剪后的人体 RGB 图做 rembg 分割，返回二值剪影图。
-
-    核心注意点：
-    - rembg 输出的是 RGBA 图，不要直接转灰度阈值
-    - 一定要取 alpha 通道
-    - 再对 alpha 通道做阈值化
-
-    返回：
-    - mask: uint8 二值图，前景=255，背景=0
-    """
-    # OpenCV 读入的是 BGR，先转 RGB
-    crop_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
-
-    # 转成 PIL 图，交给 rembg
-    pil_img = Image.fromarray(crop_rgb)
-    buf = io.BytesIO()
-    pil_img.save(buf, format="PNG")
-    input_bytes = buf.getvalue()
-
-    # rembg 去背景
-    output_bytes = remove(input_bytes, session=session)
-
-    # 读取结果，注意这里要保留 alpha 通道
-    rgba = Image.open(io.BytesIO(output_bytes)).convert("RGBA")
-
-    # 只取 alpha 通道，alpha 越大说明越像前景
-    alpha = np.array(rgba.getchannel("A"), dtype=np.uint8)
-
-    # 二值化
-    _, mask = cv2.threshold(alpha, ALPHA_THRESH, 255, cv2.THRESH_BINARY)
-
-    # 后处理
-    mask = postprocess_mask(mask)
-
-    return mask
-
-
-def save_debug_image(
-    original_bgr: np.ndarray,
-    full_mask: np.ndarray,
-    box,
-    save_path: str
-):
+def save_debug_image(original_bgr: np.ndarray, full_mask: np.ndarray, box, save_path: str):
     """
     保存调试图：
-    - 原图上画出检测框
-    - 用红色叠加显示分割结果
+    - 画 person 框
+    - 用红色叠加最终 mask
     """
-    debug = original_bgr.copy()
-
     x1, y1, x2, y2, conf = box
+
+    debug = original_bgr.copy()
     cv2.rectangle(debug, (x1, y1), (x2, y2), (0, 255, 0), 2)
     cv2.putText(
         debug,
         f"person {conf:.2f}",
         (x1, max(20, y1 - 8)),
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.6,
+        0.8,
         (0, 255, 0),
         2
     )
@@ -314,45 +279,38 @@ def save_debug_image(
 
 
 # =========================================================
-# 三、主处理函数
+# 三、主流程
 # =========================================================
 
 def process_images():
     """
     主流程：
-    1. 加载 YOLO 检测模型
-    2. 加载 rembg 人体分割模型
-    3. 遍历输入文件夹中的图片
-    4. 对每张图：
-       - 检测 person
-       - 选主人体框
-       - 裁剪
-       - rembg 分割
-       - 保存 full mask / crop mask / debug 图
+    1. 加载 YOLO-seg 模型
+    2. 遍历所有图片
+    3. 对每张图：
+       - 做实例分割
+       - 选主人体
+       - 保存 full mask / crop mask / crop rgb / debug
     """
     ensure_dir(OUTPUT_DIR)
 
     full_mask_dir = os.path.join(OUTPUT_DIR, "full_mask")
     crop_mask_dir = os.path.join(OUTPUT_DIR, "crop_mask")
-    debug_dir = os.path.join(OUTPUT_DIR, "debug")
     crop_rgb_dir = os.path.join(OUTPUT_DIR, "crop_rgb")
+    debug_dir = os.path.join(OUTPUT_DIR, "debug")
 
     ensure_dir(full_mask_dir)
-    ensure_dir(crop_mask_dir)
-    if SAVE_DEBUG:
-        ensure_dir(debug_dir)
+    if SAVE_CROP_MASK:
+        ensure_dir(crop_mask_dir)
     if SAVE_CROP_RGB:
         ensure_dir(crop_rgb_dir)
+    if SAVE_DEBUG:
+        ensure_dir(debug_dir)
 
-    # 加载 YOLO 模型
-    detector = YOLO(YOLO_MODEL_PATH)
+    # 加载模型
+    model = YOLO(MODEL_PATH)
 
-    # 加载 rembg session，指定人体分割模型
-    session = new_session(REMBG_MODEL_NAME)
-
-    # 支持的输入图片格式
     valid_exts = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
-
     image_files = sorted([
         os.path.join(INPUT_DIR, f)
         for f in os.listdir(INPUT_DIR)
@@ -360,77 +318,67 @@ def process_images():
     ])
 
     if len(image_files) == 0:
-        print(f"[退出] 输入目录中没有图片: {INPUT_DIR}")
+        print(f"[退出] 输入目录没有图片: {INPUT_DIR}")
         return
 
     print(f"共找到 {len(image_files)} 张图片，开始处理...")
 
-    # 上一帧目标中心，用于简单时序连续性约束
     prev_center = None
 
     for img_path in image_files:
         name = os.path.splitext(os.path.basename(img_path))[0]
 
-        # 读取原图
         img = cv2.imread(img_path)
         if img is None:
             print(f"[跳过] 无法读取图片: {img_path}")
             continue
 
-        h, w = img.shape[:2]
+        img_h, img_w = img.shape[:2]
 
-        # YOLO 检测
-        results = detector.predict(
+        # 做实例分割
+        results = model.predict(
             source=img,
-            conf=YOLO_CONF_THRES,
-            iou=YOLO_IOU_THRES,
+            conf=CONF_THRES,
+            iou=IOU_THRES,
             verbose=False
         )
 
         if len(results) == 0:
-            print(f"[跳过] YOLO 无结果: {img_path}")
+            print(f"[跳过] 无推理结果: {img_path}")
             continue
 
-        # 选择主人体框
-        box = choose_person_box(results[0], img_w=w, img_h=h, prev_center=prev_center)
-        if box is None:
-            print(f"[跳过] 未检测到合格的人体框: {img_path}")
+        selected = choose_main_person(
+            results[0],
+            img_h=img_h,
+            img_w=img_w,
+            prev_center=prev_center
+        )
+
+        if selected is None:
+            print(f"[跳过] 未找到合格的 person: {img_path}")
             continue
+
+        box = selected["box"]
+        full_mask = selected["mask"]
 
         x1, y1, x2, y2, conf = box
-
-        # 更新上一帧中心（如果启用了时序约束，这会用于下一帧）
         prev_center = box_center(box)
 
-        # 裁剪人体区域
-        crop = img[y1:y2, x1:x2]
-        if crop.size == 0:
-            print(f"[跳过] 裁剪区域为空: {img_path}")
-            continue
-
-        # 保存裁剪后的 RGB 图，方便检查
-        if SAVE_CROP_RGB:
-            cv2.imwrite(os.path.join(crop_rgb_dir, f"{name}.png"), crop)
-
-        # rembg 分割
-        try:
-            crop_mask = rembg_segment_human(crop, session)
-        except Exception as e:
-            print(f"[失败] rembg 处理异常: {img_path} | {e}")
-            continue
-
-        # 将裁剪区域的 mask 放回原图坐标系
-        full_mask = np.zeros((h, w), dtype=np.uint8)
-        mh, mw = crop_mask.shape[:2]
-        full_mask[y1:y1 + mh, x1:x1 + mw] = crop_mask
-
-        # 保存整图坐标系下的 mask
+        # 保存整图坐标系下的二值 mask
         full_mask_path = os.path.join(full_mask_dir, f"{name}.png")
         cv2.imwrite(full_mask_path, full_mask)
 
-        # 保存局部裁剪区域的 mask
-        crop_mask_path = os.path.join(crop_mask_dir, f"{name}.png")
-        cv2.imwrite(crop_mask_path, crop_mask)
+        # 裁剪局部 RGB 和局部 mask
+        crop_rgb = img[y1:y2, x1:x2]
+        crop_mask = full_mask[y1:y2, x1:x2]
+
+        if SAVE_CROP_RGB and crop_rgb.size > 0:
+            crop_rgb_path = os.path.join(crop_rgb_dir, f"{name}.png")
+            cv2.imwrite(crop_rgb_path, crop_rgb)
+
+        if SAVE_CROP_MASK and crop_mask.size > 0:
+            crop_mask_path = os.path.join(crop_mask_dir, f"{name}.png")
+            cv2.imwrite(crop_mask_path, crop_mask)
 
         # 保存 debug 图
         if SAVE_DEBUG:
