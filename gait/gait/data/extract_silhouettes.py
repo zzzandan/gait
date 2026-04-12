@@ -37,7 +37,7 @@ OUTPUT_DIR = "/home/zzzandan/desk/gait/gait/gait/data/output/silhouettes_yoloseg
 # 可选：
 #   yolov8n-seg.pt  速度快
 #   yolov8s-seg.pt  更准一点
-MODEL_PATH = "yolov8n-seg.pt"
+MODEL_PATH = "yolov8s-seg.pt"
 
 # person 类别 id（COCO 数据集里 person 通常是 0）
 PERSON_CLASS_ID = 0
