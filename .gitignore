@@ -1,0 +1,7 @@
+*.mp4
+*.avi
+*.mov
+**/datasets/
+**/output/
+__pycache__/
+*.pyc
