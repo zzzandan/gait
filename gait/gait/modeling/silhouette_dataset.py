@@ -163,7 +163,7 @@ class SilhouetteSequenceDataset(Dataset):
 
 if __name__ == "__main__":
     dataset = SilhouetteSequenceDataset(
-        root_dir="data/silhouettes",
+        root_dir="/home/zzzandan/desk/gait/gait/gait/data/silhouettes",
         seq_len=30,
         img_h=64,
         img_w=44,
