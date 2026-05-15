@@ -38,7 +38,14 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader, Subset
 
-from fusion_model import GaitFusionModel
+# 特征融合模型 84.42
+# from fusion_model import GaitFusionModel
+# 门控融合模型 83.17
+# from fusion_model_gated import GaitFusionModel
+# 注意力融合模型 75.24
+# from fusion_model_attention import GaitFusionModel
+# 残差融合模型 
+from fusion_model_residual import GaitFusionModel
 
 
 # =========================================================
