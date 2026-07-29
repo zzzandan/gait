@@ -296,14 +296,17 @@ def validate_one_epoch(
     running_loss = 0.0
     running_correct = 0
     running_total = 0
-    records = []
 
-    for batch_x, batch_y, batch_meta in loader:
+    for batch in loader:
+        if len(batch) == 3:
+            batch_x, batch_y, _ = batch
+        else:
+            batch_x, batch_y = batch
         batch_x = batch_x.to(device, non_blocking=True)
         batch_y = batch_y.to(device, non_blocking=True)
 
         out = model(batch_x)
-        logits = out["logits"] if isinstance(out, dict) else out
+        logits = out["logits"]
         loss = criterion(logits, batch_y)
 
         batch_size = batch_y.size(0)
@@ -313,28 +316,9 @@ def validate_one_epoch(
         running_correct += (preds == batch_y).sum().item()
         running_total += batch_size
 
-        preds_cpu = preds.cpu().tolist()
-        labels_cpu = batch_y.cpu().tolist()
-
-        person_ids = batch_meta["person_id"]
-        conditions = batch_meta["condition"]
-        seq_names = batch_meta["seq_name"]
-
-        for i in range(batch_size):
-            records.append({
-                "person_id": person_ids[i],
-                "condition": conditions[i],
-                "condition_group": extract_condition_group(conditions[i]),
-                "seq_name": seq_names[i],
-                "gt_label": int(labels_cpu[i]),
-                "pred_label": int(preds_cpu[i]),
-                "correct": int(preds_cpu[i] == labels_cpu[i]),
-            })
-
     return {
         "loss": running_loss / max(running_total, 1),
-        "acc": running_correct / max(running_total, 1),
-        "records": records
+        "acc": running_correct / max(running_total, 1)
     }
 
 

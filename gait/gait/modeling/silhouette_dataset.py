@@ -33,13 +33,15 @@ class SilhouetteSequenceDataset(Dataset):
         seq_len: int = 30,
         img_h: int = 64,
         img_w: int = 44,
-        train: bool = True
+        train: bool = True,
+        return_meta: bool = True
     ):
         self.root_dir = root_dir
         self.seq_len = seq_len
         self.img_h = img_h
         self.img_w = img_w
         self.train = train
+        self.return_meta = return_meta
 
         self.samples = []
         self.label_map = {}
@@ -77,9 +79,12 @@ class SilhouetteSequenceDataset(Dataset):
                 if len(frame_paths) == 0:
                     continue
 
+                condition = seq_name.split("_", 1)[0] if "_" in seq_name else "unknown"
                 self.samples.append({
                     "person_id": pid,
                     "label": self.label_map[pid],
+                    "seq_name": seq_name,
+                    "condition": condition,
                     "seq_dir": seq_dir,
                     "frame_paths": frame_paths
                 })
@@ -158,7 +163,15 @@ class SilhouetteSequenceDataset(Dataset):
         x = torch.from_numpy(x)                  # [T, 1, 64, 44]
         y = torch.tensor(label, dtype=torch.long)
 
-        return x, y
+        if not self.return_meta:
+            return x, y
+
+        meta = {
+            "person_id": sample["person_id"],
+            "seq_name": sample.get("seq_name", os.path.basename(sample["seq_dir"])),
+            "condition": sample.get("condition", "unknown"),
+        }
+        return x, y, meta
 
 
 if __name__ == "__main__":
@@ -172,12 +185,14 @@ if __name__ == "__main__":
 
     print("样本总数:", len(dataset))
 
-    x, y = dataset[0]
-    print("单个样本 x.shape:", x.shape)  # [T, 1, 64, 44]
+    x, y, meta = dataset[0]
+    print("单个样本 x.shape:", x.shape)
     print("单个样本 y:", y)
+    print("单个样本 meta:", meta)
 
     loader = DataLoader(dataset, batch_size=2, shuffle=True, num_workers=0)
 
-    batch_x, batch_y = next(iter(loader))
-    print("batch_x.shape:", batch_x.shape)  # [B, T, 1, 64, 44]
-    print("batch_y.shape:", batch_y.shape)  # [B]
+    batch_x, batch_y, batch_meta = next(iter(loader))
+    print("batch_x.shape:", batch_x.shape)
+    print("batch_y.shape:", batch_y.shape)
+    print("batch_meta keys:", batch_meta.keys())

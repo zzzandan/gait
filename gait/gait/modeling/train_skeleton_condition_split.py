@@ -46,6 +46,8 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Subset
 
+from eval_utils import export_thesis_reports, extract_condition_group
+
 from skeleton_dataset import SkeletonSequenceDataset
 from skeleton_branch import SkeletonBranch
 
@@ -308,7 +310,11 @@ def train_one_epoch(
     running_correct = 0
     running_total = 0
 
-    for batch_x, batch_y in loader:
+    for batch in loader:
+        if len(batch) == 3:
+            batch_x, batch_y, _ = batch
+        else:
+            batch_x, batch_y = batch
         batch_x = batch_x.to(device, non_blocking=True)
         batch_y = batch_y.to(device, non_blocking=True)
 
@@ -332,20 +338,26 @@ def train_one_epoch(
         "acc": running_correct / max(running_total, 1)
     }
 
-
 @torch.no_grad()
 def validate_one_epoch(
     model: nn.Module,
     loader: DataLoader,
     criterion: nn.Module,
     device: torch.device
-) -> Dict[str, float]:
+) -> Dict[str, object]:
     model.eval()
     running_loss = 0.0
     running_correct = 0
     running_total = 0
+    records = []
 
-    for batch_x, batch_y in loader:
+    for batch in loader:
+        if len(batch) == 3:
+            batch_x, batch_y, batch_meta = batch
+        else:
+            batch_x, batch_y = batch
+            batch_meta = None
+
         batch_x = batch_x.to(device, non_blocking=True)
         batch_y = batch_y.to(device, non_blocking=True)
 
@@ -360,9 +372,39 @@ def validate_one_epoch(
         running_correct += (preds == batch_y).sum().item()
         running_total += batch_size
 
+        if batch_meta is not None:
+            preds_cpu = preds.cpu().tolist()
+            labels_cpu = batch_y.cpu().tolist()
+
+            person_ids = batch_meta["person_id"]
+            conditions = batch_meta["condition"]
+            seq_names = batch_meta["seq_name"]
+
+            for i in range(batch_size):
+                condition = conditions[i]
+                if condition.lower().startswith("nm"):
+                    condition_group = "NM"
+                elif condition.lower().startswith("bg"):
+                    condition_group = "BG"
+                elif condition.lower().startswith("cl"):
+                    condition_group = "CL"
+                else:
+                    condition_group = "OTHER"
+
+                records.append({
+                    "person_id": person_ids[i],
+                    "condition": condition,
+                    "condition_group": condition_group,
+                    "seq_name": seq_names[i],
+                    "gt_label": int(labels_cpu[i]),
+                    "pred_label": int(preds_cpu[i]),
+                    "correct": int(preds_cpu[i] == labels_cpu[i]),
+                })
+
     return {
         "loss": running_loss / max(running_total, 1),
-        "acc": running_correct / max(running_total, 1)
+        "acc": running_correct / max(running_total, 1),
+        "records": records
     }
 
 
@@ -404,11 +446,13 @@ def main(args):
     ckpt_dir = save_dir / "checkpoints"
     log_dir = save_dir / "logs"
     split_dir = save_dir / "split_info"
+    report_dir = save_dir / "thesis_reports"
 
     ensure_dir(save_dir)
     ensure_dir(ckpt_dir)
     ensure_dir(log_dir)
     ensure_dir(split_dir)
+    ensure_dir(report_dir)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -537,6 +581,17 @@ def main(args):
         "val_conditions": split_info["val_conditions"],
     }
     save_json(summary, save_dir / "train_summary.json")
+    save_json({"best_epoch": best_epoch, "best_val_acc": best_val_acc}, save_dir / "best_metrics.json")
+
+    # 使用 best checkpoint 在验证集上重新跑一遍，导出论文需要的统计文件
+    best_ckpt = torch.load(ckpt_dir / "best.pth", map_location=device)
+    model.load_state_dict(best_ckpt["model_state_dict"], strict=True)
+    final_val_metrics = validate_one_epoch(model, val_loader, criterion, device)
+    export_thesis_reports(
+        records=final_val_metrics["records"],
+        num_classes=num_classes,
+        report_dir=report_dir
+    )
 
     print("=" * 70)
     print("训练完成")

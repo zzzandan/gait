@@ -1,22 +1,34 @@
 # -*- coding: utf-8 -*-
 """
-train_silhouette_condition_split.py
+train_skeleton_condition_split.py
 
 作用：
-使用“按条件划分”的方式训练剪影单分支模型，而不是简单的随机分层划分。
+使用“按条件划分”的方式训练骨架单分支模型，而不是简单的随机分层划分。
 
 为什么要这样做：
 - 你之前的随机划分方式，会让同一个 person_id 在训练集和验证集里同时出现大量“相近条件”的样本
-- 这种设置下，验证集往往偏容易，可能导致 val_acc 很高
+- 这种设置下，验证集往往偏容易，可能导致 val_acc 偏高
 - 对 CASIA-B 这类数据，更合理的做法是按条件划分，例如：
     训练条件：nm-01, nm-02, nm-03, nm-04
     验证条件：nm-05, nm-06, bg-01, bg-02, cl-01, cl-02
 
 当前脚本特点：
-1. 仍然复用你现有的 silhouette_dataset.py 与 silhouette_branch.py
+1. 复用你现有的 skeleton_dataset.py 与 skeleton_branch.py
 2. 不再使用随机划分 train / val
 3. 改为根据 seq_name 中的“条件字段”进行划分
-4. 自动导出 train / val 的序列名单，方便核查是否仍存在“太容易”的划分
+4. 自动导出 train / val 的序列名单，方便继续核查划分是否合理
+
+目录命名约定：
+- seq_name 应形如：
+    nm-01_090
+    nm-06_054
+    bg-01_018
+    cl-02_144
+- 其中 "_" 前面的部分会被视为条件名：
+    nm-01
+    nm-06
+    bg-01
+    cl-02
 """
 
 from __future__ import annotations
@@ -36,10 +48,13 @@ from torch.utils.data import DataLoader, Subset
 
 from eval_utils import export_thesis_reports, extract_condition_group
 
-from silhouette_dataset import SilhouetteSequenceDataset
-from silhouette_branch import SilhouetteBranch
+from skeleton_dataset import SkeletonSequenceDataset
+from skeleton_branch import SkeletonBranch
 
 
+# =========================================================
+# 1. 基础工具函数
+# =========================================================
 def ensure_dir(path: str | Path) -> None:
     Path(path).mkdir(parents=True, exist_ok=True)
 
@@ -77,22 +92,49 @@ def format_seconds(seconds: float) -> str:
 
 
 def parse_condition_from_seq_name(seq_name: str) -> str:
+    """
+    从 seq_name 中提取“条件字段”。
+
+    例如：
+        nm-01_090 -> nm-01
+        bg-02_018 -> bg-02
+        cl-01_144 -> cl-01
+    """
     if "_" not in seq_name:
         raise ValueError(f"seq_name 不符合预期格式，无法解析条件字段：{seq_name}")
     return seq_name.split("_", 1)[0]
 
 
 def parse_csv_list(s: str) -> List[str]:
+    """
+    将命令行传入的逗号分隔字符串解析为列表。
+    """
     items = [x.strip() for x in s.split(",")]
     return [x for x in items if x]
 
 
+# =========================================================
+# 2. 条件划分相关函数
+# =========================================================
 def build_condition_split_indices(
-    dataset: SilhouetteSequenceDataset,
+    dataset: SkeletonSequenceDataset,
     train_conditions: List[str],
     val_conditions: List[str],
     require_each_person_has_train_and_val: bool = True
 ) -> Tuple[List[int], List[int], dict]:
+    """
+    按条件划分 train / val。
+
+    规则：
+    - seq_name 形如 nm-01_090
+    - 条件名取 "_" 前面的部分，如 nm-01
+    - 如果该条件在 train_conditions 中，则该样本进入 train
+    - 如果该条件在 val_conditions 中，则该样本进入 val
+
+    注意：
+    - train_conditions 与 val_conditions 不能有重叠
+    - 若某个条件两边都不在，则该样本被忽略
+    """
     train_set = set(train_conditions)
     val_set = set(val_conditions)
 
@@ -149,11 +191,14 @@ def build_condition_split_indices(
 
 
 def export_split_records(
-    dataset: SilhouetteSequenceDataset,
+    dataset: SkeletonSequenceDataset,
     train_indices: List[int],
     val_indices: List[int],
     save_dir: str | Path
 ) -> None:
+    """
+    导出 train / val 的样本名单，便于核查划分是否合理。
+    """
     save_dir = Path(save_dir)
     ensure_dir(save_dir)
 
@@ -190,15 +235,21 @@ def export_split_records(
     write_grouped_txt(save_dir / "val_split_grouped.txt", val_records)
 
 
-def build_dataloaders(args) -> Tuple[DataLoader, DataLoader, SilhouetteSequenceDataset, dict, List[int], List[int]]:
-    train_dataset_full = SilhouetteSequenceDataset(
+def build_dataloaders(args) -> Tuple[DataLoader, DataLoader, SkeletonSequenceDataset, dict, List[int], List[int]]:
+    """
+    创建按条件划分后的 train / val DataLoader。
+    """
+    # 训练集使用 train=True，对序列做随机采样
+    train_dataset_full = SkeletonSequenceDataset(
         root_dir=args.data_root,
         seq_len=args.seq_len,
         img_h=args.img_h,
         img_w=args.img_w,
         train=True
     )
-    val_dataset_full = SilhouetteSequenceDataset(
+
+    # 验证集使用 train=False，对序列做均匀采样
+    val_dataset_full = SkeletonSequenceDataset(
         root_dir=args.data_root,
         seq_len=args.seq_len,
         img_h=args.img_h,
@@ -244,6 +295,9 @@ def build_dataloaders(args) -> Tuple[DataLoader, DataLoader, SilhouetteSequenceD
     return train_loader, val_loader, train_dataset_full, split_info, train_indices, val_indices
 
 
+# =========================================================
+# 3. 单轮训练 / 验证
+# =========================================================
 def train_one_epoch(
     model: nn.Module,
     loader: DataLoader,
@@ -296,14 +350,17 @@ def validate_one_epoch(
     running_loss = 0.0
     running_correct = 0
     running_total = 0
-    records = []
 
-    for batch_x, batch_y, batch_meta in loader:
+    for batch in loader:
+        if len(batch) == 3:
+            batch_x, batch_y, _ = batch
+        else:
+            batch_x, batch_y = batch
         batch_x = batch_x.to(device, non_blocking=True)
         batch_y = batch_y.to(device, non_blocking=True)
 
         out = model(batch_x)
-        logits = out["logits"] if isinstance(out, dict) else out
+        logits = out["logits"]
         loss = criterion(logits, batch_y)
 
         batch_size = batch_y.size(0)
@@ -313,31 +370,15 @@ def validate_one_epoch(
         running_correct += (preds == batch_y).sum().item()
         running_total += batch_size
 
-        preds_cpu = preds.cpu().tolist()
-        labels_cpu = batch_y.cpu().tolist()
-
-        person_ids = batch_meta["person_id"]
-        conditions = batch_meta["condition"]
-        seq_names = batch_meta["seq_name"]
-
-        for i in range(batch_size):
-            records.append({
-                "person_id": person_ids[i],
-                "condition": conditions[i],
-                "condition_group": extract_condition_group(conditions[i]),
-                "seq_name": seq_names[i],
-                "gt_label": int(labels_cpu[i]),
-                "pred_label": int(preds_cpu[i]),
-                "correct": int(preds_cpu[i] == labels_cpu[i]),
-            })
-
     return {
         "loss": running_loss / max(running_total, 1),
-        "acc": running_correct / max(running_total, 1),
-        "records": records
+        "acc": running_correct / max(running_total, 1)
     }
 
 
+# =========================================================
+# 4. checkpoint 保存
+# =========================================================
 def save_checkpoint(
     save_path: str | Path,
     model: nn.Module,
@@ -363,6 +404,9 @@ def save_checkpoint(
     torch.save(ckpt, save_path)
 
 
+# =========================================================
+# 5. 主训练函数
+# =========================================================
 def main(args):
     set_seed(args.seed)
 
@@ -381,7 +425,7 @@ def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     print("=" * 70)
-    print("开始训练：SilhouetteBranch（按条件划分）")
+    print("开始训练：SkeletonBranch（按条件划分）")
     print("=" * 70)
     print(f"device: {device}")
 
@@ -407,11 +451,10 @@ def main(args):
         save_dir=split_dir
     )
 
-    model = SilhouetteBranch(
+    model = SkeletonBranch(
         num_classes=num_classes,
-        in_channels=1,
+        in_channels=2,
         feature_dim=args.feature_dim,
-        num_bins=args.num_bins,
         dropout=args.dropout
     ).to(device)
 
@@ -529,19 +572,22 @@ def main(args):
     print("=" * 70)
 
 
+# =========================================================
+# 6. 参数解析
+# =========================================================
 def build_parser():
-    parser = argparse.ArgumentParser(description="训练剪影单分支模型（按条件划分 train / val）")
+    parser = argparse.ArgumentParser(description="训练骨架单分支模型 SkeletonBranch（按条件划分 train / val）")
 
     parser.add_argument(
         "--data_root",
         type=str,
-        default="/home/zzzandan/desk/gait/gait/gait/data/silhouettes",
-        help="剪影数据根目录"
+        default="/home/zzzandan/desk/gait/gait/gait/data/skeletons",
+        help="骨架数据根目录，目录结构应为 person_id/seq_name/frame.npy"
     )
     parser.add_argument(
         "--save_dir",
         type=str,
-        default="/home/zzzandan/desk/gait/gait/gait/outputs/silhouette_condition_split_exp1",
+        default="/home/zzzandan/desk/gait/gait/gait/outputs/skeleton_condition_split_exp1",
         help="实验输出目录"
     )
 
@@ -564,18 +610,17 @@ def build_parser():
     )
 
     parser.add_argument("--seq_len", type=int, default=30, help="每个序列采样多少帧")
-    parser.add_argument("--img_h", type=int, default=64, help="输入图像高度")
-    parser.add_argument("--img_w", type=int, default=44, help="输入图像宽度")
+    parser.add_argument("--img_h", type=int, default=64, help="输入 Skeleton Map 高度")
+    parser.add_argument("--img_w", type=int, default=44, help="输入 Skeleton Map 宽度")
     parser.add_argument("--batch_size", type=int, default=4, help="batch size")
     parser.add_argument("--num_workers", type=int, default=0, help="DataLoader num_workers")
-    parser.add_argument("--feature_dim", type=int, default=256, help="embedding 维度")
-    parser.add_argument("--num_bins", type=int, default=4, help="水平分块数量")
-    parser.add_argument("--dropout", type=float, default=0.1, help="dropout 比例")
+    parser.add_argument("--feature_dim", type=int, default=256, help="最终 embedding 维度")
+    parser.add_argument("--dropout", type=float, default=0.1, help="全连接层后的 dropout 比例")
     parser.add_argument("--epochs", type=int, default=30, help="训练轮数")
     parser.add_argument("--lr", type=float, default=1e-3, help="初始学习率")
-    parser.add_argument("--weight_decay", type=float, default=1e-4, help="权重衰减")
-    parser.add_argument("--lr_step_size", type=int, default=10, help="StepLR step_size")
-    parser.add_argument("--lr_gamma", type=float, default=0.5, help="StepLR gamma")
+    parser.add_argument("--weight_decay", type=float, default=1e-4, help="权重衰减系数")
+    parser.add_argument("--lr_step_size", type=int, default=10, help="StepLR 的 step_size")
+    parser.add_argument("--lr_gamma", type=float, default=0.5, help="StepLR 的 gamma")
     parser.add_argument("--seed", type=int, default=42, help="随机种子")
 
     return parser
